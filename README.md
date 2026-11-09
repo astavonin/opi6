@@ -47,22 +47,19 @@ The vendor BSP is the only stack that drives the MIPI camera, NPU and VPU. Armbi
 | HW encode (USB camera) | 720p and 1080p, H.264 and H.265 — reliable |
 | File → HW encode | H.265, verified with `ffprobe` |
 
-### MIPI capture fails when `isp_app` is stale
+### MIPI captures race a 5-second window
 
-The vendor ISP daemon goes bad after sitting idle. Failure tracks **daemon uptime**, not resolution or codec:
+`isp-daemon` runs `isp_app -s 0`, but **`-s` is not a valid flag** (usage: `-h -g -f -d -p`). With no valid instruction `isp_app` runs a default cycle — configure camera, `FAKE SLEEP: sleepTimeUs = 5000000`, `camera 0 stopped`, exit — and `Restart=always` loops it forever.
 
-| `isp_app` age at capture | outcome |
-|---|---|
-| 192 s, 216 s | FAIL |
-| 8 s, 14 s, 17 s, 112 s | OK |
+The camera is therefore up ~5 s, down ~1–2 s, continuously. A ~3.8 s capture succeeds only if it starts early enough in a window; otherwise the camera is torn down mid-stream and GStreamer waits for buffers that never arrive (~43 s timeout). That is the ~60 % success rate.
 
-A failed attempt makes `isp_app` exit; systemd restarts it (`Restart=always`), and captures work again until it next idles. Failures **hang** (~48 s to timeout, 0 bytes); successes take ~3.8 s.
+**Bypass: retry.** Each attempt is ~60 %; two gets you to ~84 %.
 
-**Bypass: retry once.** The first capture after an idle period may fail — that failure restarts the ISP, and the retry succeeds.
-
-Do **not** `systemctl restart isp-daemon` before every capture in a loop. It works individually (verified), but repeated restarts rebooted the board twice.
+Do **not** loop `systemctl restart isp-daemon` — that rebooted the board twice.
 
 For anything that must not fail, use the **USB camera** — `uvcvideo` never touches the ISP and was 100 % reliable.
+
+Full architecture comparison against a Raspberry Pi 5, and the alternatives we ruled out: [docs/isp-vs-rpi5.md](docs/isp-vs-rpi5.md).
 
 #### The sensor is not the cause
 
