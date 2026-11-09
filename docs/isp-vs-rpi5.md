@@ -21,11 +21,11 @@ On the opi6, a vendor daemon must be running for the ISP to work at all, and tha
 
 | Issue | Evidence |
 |---|---|
-| **~40 % of MIPI captures fail** | `isp_app` runs the camera ~5 s then exits (`FAKE SLEEP: sleepTimeUs = 5000000` → `camera 0 stopped`); `Restart=always` loops it. A ~3.8 s capture only succeeds if it fits inside a window |
 | **The daemon cannot be removed** | with `isp-daemon` stopped: 0 OK / 3 FAIL, 33 s hangs |
 | **The daemon cannot own the stream either** | `isp_app -f` with `start` keeps the camera up, but then GStreamer gets EBUSY in 220 ms: 1 OK / 5 FAIL |
 | **Only one camera is active** | the unit runs `isp_app -s 0`; `/dev/video7`, `/dev/video8` deliver no frames |
-| **`-s` is not even a valid flag** | `isp_app` usage lists only `-h -g -f -d -p`. The service passes an option the binary does not accept, which is why it falls into the 5 s demo cycle |
+| **Capture usually fails** | 3 of 10 MIPI runs succeeded in a measured pass, against 10 of 10 on USB on the same board. Failures hang rather than error, and one run rebooted the board. The mechanism is not established |
+| **Half the daemon's interface is undocumented** | `isp_app -h` lists five options; the binary's getopt string is `hgtf:m:s:dp:nc` — ten. The `-s` the unit passes is valid and functional (`Set singleCamIdx 0`), just absent from the help |
 | **Non-standard colorimetry** | driver reports `2:4:16:1` (BT601 matrix+transfer, BT709 primaries) — matches no GStreamer preset. `colorimetry=bt709` must be forced or negotiation fails |
 | **Multiplanar-only capture** | format is `NM12`, Video Capture **Multiplanar**. `ffmpeg` cannot open it at all; `videoparse` SIGSEGVs on the non-contiguous planes |
 | **Misuse crashes the board** | repeated ISP restarts, two pipelines on one node, and `v4l2-ctl --all` have each required a power cycle |
@@ -50,17 +50,19 @@ No — and only partly for the obvious reason.
 
 The real question is whether we could bypass `isp_app` entirely: bind a mainline sensor driver, take raw Bayer off the CSI receiver, do the ISP work in software. The open kernel driver looks encouraging at first — `armcb_sensor.c` uses the standard `v4l2_async_nf` and `fwnode` binding that mainline sensor drivers rely on.
 
-The device tree then closes the door:
+The media graph then closes the door. The board boots **ACPI, not device tree** (`acpi=force`, no `/proc/device-tree`, DSDT signed `CIXTEK SKY1EDK2`) — so the DTB sitting on the ESP describes a file, not this machine. The evidence that matters is on the running system and in the driver source:
 
 | Needed to attach a mainline sensor | Reality |
 |---|---|
-| Driver speaks async/fwnode | ✅ it does |
-| A real sensor `compatible` | ❌ `compatible = "image,sensor0"` — a generic placeholder. Mainline binds on `sony,imx477` |
-| CSI receiver enabled | ❌ `csi@14280000` and siblings are `status = "disabled"` |
-| `ports` / `endpoints` media graph | ❌ absent — nothing describes sensor↔receiver links |
-| Standalone CSI capture, no ISP | ❌ not implemented by the driver |
+| A real sensor `compatible` | ❌ the driver's `of_match_table` holds one generic entry, `{ .compatible = "image,sensor0" }`. Live binding is by ACPI HID (`armcb,isp` ← `CIXH3021:00`). Mainline binds on `sony,imx477` |
+| A media graph to attach to | ❌ **`media_create_pad_link` appears zero times** in the whole GPL driver, against eight other media calls |
+| …and on the board | ❌ all three ISP media devices: **13 entities, every one `(0 pad, 0 link)`**. Pi 5 with the same tool: **44 entities, 44 links, none unlinked** |
+| Sensor subdev with real ops | ❌ all three `v4l2_subdev_ops` fill only `.core`; the sensor ioctl handles one command and returns `-ENOIOCTLCMD` for everything else |
+| Standalone CSI capture, no ISP | ❌ not implemented |
 
-Sensor identity never comes from the device tree at all; `isp_app` injects it at runtime through the private `ARMCB_VIDIOC_APPLY_CMD` ioctl. Our sensor sits at I²C `0x34`; Pi sensors sit at `0x1a`.
+Sensor identity never comes from firmware at all. It crosses from userspace as a `char sName[32]` the driver merely logs, with register writes passed through as opaque bytes to `i2c_master_send` under the driver's own comment `/// already sort in userspace`. **Zero sensor model names appear in the 584 KB GPL tree**; the three (`ov13850/55/58`) live in the closed binary.
+
+The irony: `ov13858.c` **is** in mainline and sits unused, and this kernel also ships unused `imx219`, `imx412`, `ov5640` and `ov5645` drivers. The sensor drivers exist. Nothing can reach them.
 
 So a bypass is not configuration, it is kernel work: write the endpoint graph, enable the CSI receivers, add a standalone capture path, then run a software ISP with no tuning data and poor image quality for the trouble.
 
@@ -69,7 +71,7 @@ So a bypass is not configuration, it is kernel work: write the endpoint graph, e
 ## Practical guidance
 
 - **If it must not fail, use a USB camera.** It bypasses the entire vendor ISP.
-- **On MIPI, retry.** Each attempt is ~60 %; two attempts gets you to ~84 %.
+- **On MIPI, retry.** A measured pass got 3 of 10; budget for repeats rather than a fixed rate.
 - Do not loop `systemctl restart isp-daemon` — that rebooted the board twice.
 
 ## What is open and what is not

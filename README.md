@@ -43,17 +43,19 @@ The vendor BSP is the only stack that drives the MIPI camera, NPU and VPU. Armbi
 | Camera capture | `/dev/video9` only — NM12, 1920×1080 / 1280×720 / 640×480 @ 30 fps |
 | Raw capture to disk | 720p, exact byte count |
 | HW encode (synthetic) | H.264 + H.265 at 1080p from `videotestsrc` |
-| HW encode (MIPI camera) | 720p **and** 1080p, H.264 and H.265 — ~60 % of runs, see below |
+| HW encode (MIPI camera) | 720p **and** 1080p, H.264 and H.265 — but unreliable, see below |
 | HW encode (USB camera) | 720p and 1080p, H.264 and H.265 — reliable |
 | File → HW encode | H.265, verified with `ffprobe` |
 
-### MIPI captures race a 5-second window
+### MIPI capture is unreliable; the mechanism is not established
 
-`isp-daemon` runs `isp_app -s 0`, but **`-s` is not a valid flag** (usage: `-h -g -f -d -p`). With no valid instruction `isp_app` runs a default cycle — configure camera, `FAKE SLEEP: sleepTimeUs = 5000000`, `camera 0 stopped`, exit — and `Restart=always` loops it forever.
+Measured on one sitting: **3 of 10** MIPI runs succeeded, against **10 of 10** on the USB camera on the same board. Failures hang rather than error. The board hard-rebooted during run 8.
 
-The camera is therefore up ~5 s, down ~1–2 s, continuously. A ~3.8 s capture succeeds only if it starts early enough in a window; otherwise the camera is torn down mid-stream and GStreamer waits for buffers that never arrive (~43 s timeout). That is the ~60 % success rate.
+**The cause is not pinned down.** An earlier session observed `isp_app` stopping the camera ~5 s after start (`FAKE SLEEP: sleepTimeUs = 5000000`, then `camera 0 stopped`) with systemd restarting it, which would explain a race. That was **not reproducible**: a later pass saw no such lines on either boot and `NRestarts` stayed 0. The format string does exist in the binary, so it is a real code path — but journald here keeps only the current boot, so the original observation can no longer be read back. Treat the 5-second cycle as a lead, not the answer.
 
-**Bypass: retry.** Each attempt is ~60 %; two gets you to ~84 %.
+`isp-daemon` runs `isp_app -s 0`. **`-s` is undocumented but valid** — the binary's getopt string is `hgtf:m:s:dp:nc`, `-s` takes an argument, and the daemon logs `Set singleCamIdx 0`. Five of its ten options are missing from `-h`.
+
+**Bypass: retry**, and expect a poor hit rate.
 
 Do **not** loop `systemctl restart isp-daemon` — that rebooted the board twice.
 
@@ -69,7 +71,7 @@ Full architecture comparison against a Raspberry Pi 5, and the alternatives we r
 Hw_Env_Sensor_Probe(581): Probe Success, sensorId = 0, chipId = 0xd8
 ```
 
-`isp_app` contains `ov13850`, `ov13855` and `ov13858`. Our module (sold for OPi 5 / RK3588) is recognised. Swapping it for an OV13855 would not address the daemon-staleness fault.
+`isp_app` contains `ov13850`, `ov13855` and `ov13858`. Our module (sold for OPi 5 / RK3588) is recognised. Swapping it for an OV13855 would change nothing — zero sensor model names appear anywhere in the 584 KB GPL driver tree, so sensor handling is entirely inside the closed binary either way.
 
 ### The pipeline that works
 
@@ -99,7 +101,7 @@ gst-launch-1.0 -e v4l2src device=/dev/video3 num-buffers=60 \
 
 | Thing | Symptom |
 |---|---|
-| MIPI encode, ~40 % of runs | hangs when `isp_app` is stale. Not resolution- or codec-specific. Retry once |
+| MIPI encode, most runs | hangs; 3/10 succeeded in a measured pass vs 10/10 on USB. Not resolution- or codec-specific. Retry |
 | `output-io-mode=dmabuf` on the encoder | hangs every time here, despite appearing in the vendor's own documented pipeline |
 | `/dev/video7`, `/dev/video8` | no frames — **expected**: `isp-daemon` runs `isp_app -s 0` (single sensor). Use `-m 2` for both CSI ports |
 | **ffmpeg** camera capture | `Not a video capture device` — its v4l2 demuxer cannot open multiplanar nodes |
