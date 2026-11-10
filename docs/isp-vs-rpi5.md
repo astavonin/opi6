@@ -32,7 +32,7 @@ On the opi6, a vendor daemon must be running for the ISP to work at all, and tha
 
 None of these exist on the rpi5, because none of the preconditions do.
 
-## Alternatives, and why they fail
+## Alternatives we tried
 
 | Option | Result |
 |---|---|
@@ -44,29 +44,47 @@ None of these exist on the rpi5, because none of the preconditions do.
 
 ## Can we just use Raspberry Pi cameras?
 
-No — and only partly for the obvious reason.
+Not as a configuration change. There are two possible routes and they fail differently — the distinction matters, because on an Orange Pi 5 the same question is answered by a one-line device-tree overlay.
 
-`isp_app` knows exactly three sensors: **ov13850, ov13855, ov13858**. Pi cameras are **imx708** (Module 3) and **imx477** (HQ). No overlap, and the sensor tables are compiled into the closed binary, so the list cannot be extended. An IMX sensor on the CSI port would not be a flaky camera — it would be no camera.
+`isp_app` knows exactly three sensors: **ov13850, ov13855, ov13858**. Pi cameras are **imx708** and **imx477**. The sensor tables are compiled into the closed binary, so that list cannot be extended from outside.
 
-The real question is whether we could bypass `isp_app` entirely: bind a mainline sensor driver, take raw Bayer off the CSI receiver, do the ISP work in software. The open kernel driver looks encouraging at first — `armcb_sensor.c` uses the standard `v4l2_async_nf` and `fwnode` binding that mainline sensor drivers rely on.
+### Route 1 — mainline sensor driver + libcamera. Blocked.
 
-The media graph then closes the door. The board boots **ACPI, not device tree** (`acpi=force`, no `/proc/device-tree`, DSDT signed `CIXTEK SKY1EDK2`) — so the DTB sitting on the ESP describes a file, not this machine. The evidence that matters is on the running system and in the driver source:
+Bind `imx708.ko`, take raw Bayer off the CSI receiver, do the ISP work in software. The open kernel driver looks encouraging — `armcb_sensor.c` uses the standard `v4l2_async_nf` and `fwnode` binding mainline sensor drivers rely on. The media graph then closes the door:
 
 | Needed to attach a mainline sensor | Reality |
 |---|---|
 | A real sensor `compatible` | ❌ the driver's `of_match_table` holds one generic entry, `{ .compatible = "image,sensor0" }`. Live binding is by ACPI HID (`armcb,isp` ← `CIXH3021:00`). Mainline binds on `sony,imx477` |
+| A device tree to overlay | ❌ the board boots **ACPI** (`acpi=force`, no `/proc/device-tree`, DSDT `CIXTEK SKY1EDK2`). The DTBs on the ESP describe a file, not this machine |
 | A media graph to attach to | ❌ **`media_create_pad_link` appears zero times** in the whole GPL driver, against eight other media calls |
 | …and on the board | ❌ all three ISP media devices: **13 entities, every one `(0 pad, 0 link)`**. Pi 5 with the same tool: **44 entities, 44 links, none unlinked** |
 | Sensor subdev with real ops | ❌ all three `v4l2_subdev_ops` fill only `.core`; the sensor ioctl handles one command and returns `-ENOIOCTLCMD` for everything else |
-| Standalone CSI capture, no ISP | ❌ not implemented |
 
-Sensor identity never comes from firmware at all. It crosses from userspace as a `char sName[32]` the driver merely logs, with register writes passed through as opaque bytes to `i2c_master_send` under the driver's own comment `/// already sort in userspace`. **Zero sensor model names appear in the 584 KB GPL tree**; the three (`ov13850/55/58`) live in the closed binary.
+### Route 2 — drive the vendor pipe directly. Open, but unbuilt.
 
-The irony: `ov13858.c` **is** in mainline and sits unused, and this kernel also ships unused `imx219`, `imx412`, `ov5640` and `ov5645` drivers. The sensor drivers exist. Nothing can reach them.
+The kernel driver holds no sensor knowledge at all. Sensor identity crosses from userspace as a `char sName[32]` the driver merely logs, and `ARMCB_VIDIOC_APPLY_CMD` carries a **generic register-poke payload**:
 
-So a bypass is not configuration, it is kernel work: write the endpoint graph, enable the CSI receivers, add a standalone capture path, then run a software ISP with no tuning data and poor image quality for the trouble.
+```c
+struct cmd_i2c_setting { channel; slave_addr; direct; reg_addr_type;
+                         reg_data_type; reg_addr; val; delay_us; };
+enum dev_type    { DRV_DEV_SENSOR, DRV_DEV_ACTUOAOR, DRV_DEV_ISP, DRV_DEV_CSI };
+enum hw_bus_type { HW_BUS_I2C, SPI, GPIO, PMIC, AHB, AHB_POWER, ... };
+```
 
-**The OV13850 we have is already one of the three supported parts and probes successfully** (`Probe Success, chipId = 0xd8`). Swapping sensors changes nothing.
+One ioctl reaches sensor, actuator, ISP **and CSI**, over I²C, GPIO, PMIC and memory-mapped AHB, including power rails. That is the whole bring-up surface `isp_app` uses, and the structs are in the GPL header. `slave_addr` is userspace-supplied, so a sensor at a different I²C address is a wiring question, not a software one.
+
+So this is **userspace work, not kernel work** — a replacement for the sensor bring-up half of `isp_app`. Register sequences come from mainline (`imx708.c`, GPL). What nobody has written, and what makes it a project rather than a patch:
+
+- **ISP configuration for an unknown sensor** — Bayer order, bit depth, black level, lens shading. `isp_app` derives these from its built-in table.
+- **3A** — closed. Fixed exposure and gain until reimplemented, so worse image quality than the OV13850 already gives.
+
+### How the Orange Pi 5 does it
+
+An Orange Pi 5 takes a Pi camera through a pinout adapter plus one overlay: `U_BOOT_FDT_OVERLAYS=".../orangepi-5-ov5647-c1.dtbo"`. RK3588 boots device tree, ships in-kernel `ov5647`/`imx219`/`imx519`/`imx477`, and builds a real media graph. Every one of those is what the CIX P1 lacks — which is why an adapter solves the physical half here and leaves the software half untouched.
+
+The irony: `ov13858.c` **is** in mainline and sits unused, and this kernel also ships unused `imx219`, `imx412`, `ov5640` and `ov5645` drivers. The sensor drivers exist. Nothing reaches them.
+
+**The OV13850 we have is the native module for this Orange Pi line and probes cleanly** (`Probe Success, chipId = 0xd8`). Swapping sensors changes nothing.
 
 ## Practical guidance
 
