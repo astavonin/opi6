@@ -12,13 +12,17 @@ This is the **only** file in this repo written for an LLM. Everything else is fo
 
 `opi6` — Orange Pi 6 Plus, CIX P1 (CD8180, codename Sky1). UEFI/EDK2 in SPI flash, pure ACPI boot, root on NVMe. Reach it with `ssh opi6`; key auth only, `astavonin` has passwordless sudo, `root` by key works.
 
+**Running now: the Orange Pi vendor image — Ubuntu 24.04 Noble, kernel `6.6.89-cix`, NetworkManager.** It replaced an Armbian install in Nov 2026. Check before trusting any older note: `uname -r` and `. /etc/os-release`.
+
 ## Gotchas that have already cost time
 
-- **No NetworkManager.** The Armbian minimal image ships an empty `/etc/NetworkManager/` directory but no binary. Writing `.nmconnection` files silently does nothing. Real stack: `systemd-networkd` + `wpa_supplicant@wlp1s0`. Detect network stacks by **binary**, never by directory.
+- **Detect a network stack by its binary, never by a directory.** The Armbian image shipped an empty `/etc/NetworkManager/` with no binary, so `.nmconnection` files written there did nothing at all. The vendor image genuinely runs NetworkManager (`nmcli` present, service active, `systemd-networkd` inactive) — so the same directory check is right by accident now and wrong again after the next reflash. Test `-x /usr/sbin/NetworkManager`.
 - **Interface names are predictable, not `wlan0`.** WiFi is `wlp1s0`; Ethernet `enp97s0` and `enp49s0`, consecutive MACs.
 - **Power.** 20 V PD, 65 W minimum. A 27 W supply lights the standby LED and nothing else — it never reaches PD negotiation for 20 V.
 - **No fan control from the OS.** No ACPI fan object, no PWM chip, no EC, no i2c adapter. The only knob is BIOS → EC Fan Mode, already on Auto.
-- **GPU/NPU/VPU have no drivers on `current-arm64`.** ACPI declares `\_SB.VPU0` (4 cores) and `\_SB.NPU0` (3 cores); nothing binds, and `/dev/video*` does not exist. `edge-cix-p1` adds `panthor` for the GPU but its config has `CONFIG_DRM_ACCEL is not set` and no Linlon codec driver — so NPU and hardware encode need the vendor BSP image.
+- **GPU, NPU and VPU work on the vendor image, and only there.** `mali_kbase` loaded, `/dev/aipu`, `/dev/video0-9`. Mainline and Armbian have none of it: `current-arm64` binds nothing, and `edge-cix-p1` adds `panthor` for the GPU but sets `CONFIG_DRM_ACCEL is not set` and ships no Linlon codec driver.
+- **MIPI capture is unreliable and the cause is unknown.** 3 of 10 runs in a measured pass, against 10 of 10 on a USB camera. Retry rather than concluding a pipeline is broken from one run. `colorimetry=bt709` is mandatory — the driver rejects GStreamer's `bt601` guess.
+- **The vendor v4l2 layer crashes the board.** Two pipelines on one node, looping `systemctl restart isp-daemon`, and `v4l2-ctl --all` against an ISP node have each required a power cycle. One pipeline at a time, check reachability between runs.
 - **`sudo` on the laptop is per-TTY.** Each Bash tool call authenticates separately; run multi-step root work inside a single invocation. `zenity` works as a `SUDO_ASKPASS` helper when there is no TTY.
 
 ## Changing the kernel or network config

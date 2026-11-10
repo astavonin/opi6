@@ -26,13 +26,15 @@ Key: `~/.ssh/id_ed25519_opi6`. Password login is **off** — that key is the onl
 | Ethernet | 2× → `enp97s0`, `enp49s0` |
 | Power | USB-C PD **20 V, 65 W min, 100 W recommended** |
 
-Draw: 13.7 W idle · 26.7 W load · 41.4 W peak. A Raspberry Pi 5 supply will not start it.
+Draw: 13.7 W idle · 26.7 W load · 41.4 W peak — published figures for the Orange Pi 6 (same SoC), not measured on this board. A Raspberry Pi 5 supply will not start it.
 
 ## OS
 
-Orange Pi vendor image 1.0.2 (Ubuntu 24.04 Noble), kernel **6.6.89-cix**, root on NVMe.
+Orange Pi vendor image 1.0.2 (Ubuntu 24.04 Noble), kernel **6.6.89-cix**, root on NVMe. Network is **NetworkManager** (`nmcli`); `systemd-networkd` is inactive.
 
 The vendor BSP is the only stack that drives the MIPI camera, NPU and VPU. Armbian and mainline have no ISP, no Zhouyi and no Linlon codec driver — GPU only, and even that needs device-tree boot.
+
+It replaced an Armbian install, which used `systemd-networkd` + `wpa_supplicant` and had none of the accelerators. Check `uname -r` before trusting any note that predates the swap.
 
 ## Verified working
 
@@ -51,7 +53,7 @@ The vendor BSP is the only stack that drives the MIPI camera, NPU and VPU. Armbi
 
 Measured on one sitting: **3 of 10** MIPI runs succeeded, against **10 of 10** on the USB camera on the same board. Failures hang rather than error. The board hard-rebooted during run 8.
 
-**The cause is not pinned down.** An earlier session observed `isp_app` stopping the camera ~5 s after start (`FAKE SLEEP: sleepTimeUs = 5000000`, then `camera 0 stopped`) with systemd restarting it, which would explain a race. That was **not reproducible**: a later pass saw no such lines on either boot and `NRestarts` stayed 0. The format string does exist in the binary, so it is a real code path — but journald here keeps only the current boot, so the original observation can no longer be read back. Treat the 5-second cycle as a lead, not the answer.
+**The cause is not pinned down.** An earlier session observed `isp_app` stopping the camera ~5 s after start (`FAKE SLEEP: sleepTimeUs = 5000000`, then `camera 0 stopped`) with systemd restarting it, which would explain a race. That was **not reproducible**: a later pass saw no such lines on either boot and `NRestarts` stayed 0. The format string does exist in the binary, so it is a real code path. At the time the journal was volatile, so the original observation could not be re-read — that is fixed now (see Guards), and a recurrence will be captured. Treat the 5-second cycle as a lead, not the answer.
 
 `isp-daemon` runs `isp_app -s 0`. **`-s` is undocumented but valid** — the binary's getopt string is `hgtf:m:s:dp:nc`, `-s` takes an argument, and the daemon logs `Set singleCamIdx 0`. Five of its ten options are missing from `-h`.
 
@@ -103,7 +105,7 @@ gst-launch-1.0 -e v4l2src device=/dev/video3 num-buffers=60 \
 |---|---|
 | MIPI encode, most runs | hangs; 3/10 succeeded in a measured pass vs 10/10 on USB. Not resolution- or codec-specific. Retry |
 | `output-io-mode=dmabuf` on the encoder | hangs every time here, despite appearing in the vendor's own documented pipeline |
-| `/dev/video7`, `/dev/video8` | no frames — **expected**: `isp-daemon` runs `isp_app -s 0` (single sensor). Use `-m 2` for both CSI ports |
+| `/dev/video7`, `/dev/video8` | no frames — **expected**: `isp-daemon` runs `isp_app -s 0` (single sensor). `-m 2` is said to enable both CSI ports; **untested here**, and `-m` is one of the five options `-h` does not document |
 | **ffmpeg** camera capture | `Not a video capture device` — its v4l2 demuxer cannot open multiplanar nodes |
 | `videoparse` on camera buffers | SIGSEGV (treats non-contiguous NM12 planes as packed) |
 | Default colorimetry | driver rejects `bt601`; must force `bt709` |
@@ -136,14 +138,34 @@ sudo parted -s -a none /dev/sdX resizepart 2 100%
 sudo e2fsck -fy /dev/sdX2
 ```
 
-Guards now in place on the board: `orangepi-resize-filesystem` masked, `errors=remount-ro`, `fsck.repair=yes`, root in `fstab` with `passno=1`, persistent journal.
+### Guards
+
+`scripts/make-headless.sh` applies all of these at flash time, so a reflash does not quietly lose them:
+
+| Guard | Without it |
+|---|---|
+| vendor resize service masked | it re-creates the root partition **smaller than the filesystem** — the unbootable loop above |
+| `errors=remount-ro` on the rootfs | ext4 default is `Continue`: it runs on through corruption instead of failing safe |
+| root in `fstab` with `passno=1` | no boot-time fsck runs at all — the vendor fstab has no root line |
+| `fsck.repair=yes` on the kernel line | a dirty filesystem drops to an emergency shell, which on a headless board is a dead box |
+| RAM-log disabled, persistent journal | crash logs are lost, which is exactly when you need them (see below) |
+
+### Logs survive a crash
+
+The vendor image mounts `/var/log` as a **50 MB tmpfs** (`orangepi-ramlog`) and rsyncs it to `/var/log.hdd` only from the service's `ExecStop` — no timer, no periodic flush. A clean shutdown keeps the logs; a hard hang loses everything since the last sync, which is precisely the case you need them for.
+
+Setting `Storage=persistent` alone does nothing here: it points journald at a RAM filesystem recreated every boot. Worse, a `SystemMaxUse` larger than the tmpfs tells journald it has headroom it does not, and fills `/var/log`.
+
+`orangepi-ramlog` is now disabled and masked, so `/var/log` is the NVMe. Verified by planting a marker, rebooting, and reading it back — `journalctl --list-boots` now shows boot `-1`.
+
+`scripts/make-headless.sh` does this at flash time; `--keep-ramlog` opts out, which is only right when the target is an SD card.
 
 ## Scripts
 
 Run on a laptop, against the SSD in a USB enclosure — not on the board. `--help` on each.
 
-- `scripts/flash-image.sh` — wipe disk, write image, grow rootfs to fill it.
-- `scripts/make-headless.sh` — inject WiFi, SSH key, user and hostname into the flashed rootfs.
+- `scripts/flash-image.sh` — wipe disk, write image, relocate the GPT backup header, grow the rootfs to fill it.
+- `scripts/make-headless.sh` — everything needed for the board to come up headless and stay recoverable: WiFi, SSH key, user, hostname, and the five Guards above. Detects the image's network stack by **binary**, so it works on both the vendor image (NetworkManager) and Armbian (networkd + wpa_supplicant).
 
 ## BIOS
 

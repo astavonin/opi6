@@ -46,6 +46,9 @@ usage() {
 		  --wifi-firmware P   Warn unless /lib/firmware/P exists in the image
 		  --keep-host-keys    Do not clear the image's baked-in SSH host keys
 		  --keep-passwords    Do not touch any existing password hash
+		  --keep-ramlog       Leave the vendor RAM-log service enabled. Only do
+		                      this when the target is an SD card -- on any other
+		                      medium it costs crash logs and buys nothing
 	EOF
 }
 
@@ -54,6 +57,7 @@ hostname=opi6
 pubkey=
 keep_host_keys=0
 keep_passwords=0
+keep_ramlog=0
 country=
 wifi_driver=
 wifi_firmware=
@@ -105,6 +109,10 @@ while (($#)); do
 		keep_passwords=1
 		shift
 		;;
+	--keep-ramlog)
+		keep_ramlog=1
+		shift
+		;;
 	--keep-host-keys)
 		keep_host_keys=1
 		shift
@@ -153,16 +161,28 @@ root_name=$(lsblk -bnro NAME,FSTYPE,SIZE,TYPE "$dev" |
 root_part=/dev/$root_name
 
 mnt=$(mktemp -d /tmp/opi6-root.XXXXXX)
+esp_mnt=$(mktemp -d /tmp/opi6-esp.XXXXXX)
 cleanup() {
 	# Flush before the enclosure is unplugged; a dirty USB-attached ext4 is the
 	# classic cause of a board that never boots after prep.
 	sync
+	mountpoint -q "$esp_mnt" && umount "$esp_mnt"
 	mountpoint -q "$mnt" && umount "$mnt"
-	rmdir "$mnt" 2>/dev/null || true
+	rmdir "$mnt" "$esp_mnt" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 mount "$root_part" "$mnt"
+
+# The ESP carries the kernel command line, so the boot-time fsck policy is set
+# there rather than in the rootfs. Optional: an image without one still gets
+# every rootfs-side guard below.
+esp_part=$(lsblk -bnro NAME,FSTYPE,TYPE "$dev" | awk '$3=="part" && $2=="vfat" {print $1; exit}')
+if [[ -n $esp_part ]] && mount "/dev/$esp_part" "$esp_mnt" 2>/dev/null; then
+	esp=$esp_mnt
+else
+	esp=
+fi
 [[ -f $mnt/etc/os-release ]] || die "$root_part does not look like a Linux rootfs"
 
 info "Target rootfs"
@@ -534,6 +554,135 @@ if [[ -f $mnt/etc/shadow ]] && awk -F: '$3=="0"' "$mnt/etc/shadow" | grep -q .; 
 	note "cleared forced password change for: $forced"
 else
 	note "no forced password changes"
+fi
+
+# ---------------------------------------------------------------- survive a bad boot
+
+info "Boot resilience"
+
+# The vendor image resizes its own root partition on first boot. flash-image.sh
+# has already grown it to fill the disk, so this run has nothing to do -- and on
+# this board it once recreated the partition SMALLER than the filesystem inside
+# it, which reads as an unbootable loop and needs the SSD pulled to repair.
+resize_unit=
+for n in orangepi-resize-filesystem armbian-resize-filesystem; do
+	[[ -f $mnt/lib/systemd/system/$n.service || -f $mnt/usr/lib/systemd/system/$n.service ]] && {
+		resize_unit=$n
+		break
+	}
+done
+if [[ -n $resize_unit ]]; then
+	rm -f "$mnt"/etc/systemd/system/*.wants/"$resize_unit".service
+	ln -sf /dev/null "$mnt/etc/systemd/system/$resize_unit.service"
+	note "$resize_unit masked"
+else
+	note "no vendor resize service in the image"
+fi
+
+# Fail safe on ext4 error rather than running on through it. The vendor default
+# is Continue, which is how a size mismatch became a crash loop instead of a
+# read-only filesystem you could still log into.
+if tune2fs -e remount-ro "$root_part" >/dev/null 2>&1; then
+	note "ext4 errors=remount-ro"
+else
+	warn "could not set ext4 error behaviour on $root_part"
+fi
+
+# A root entry with passno=1 is what runs fsck at boot at all. The vendor image
+# ships an fstab with no root line, relying on the kernel cmdline alone.
+root_uuid=$(blkid -s UUID -o value "$root_part" 2>/dev/null)
+if [[ -n $root_uuid ]] && ! grep -qE "^[^#]*\s/\s" "$mnt/etc/fstab" 2>/dev/null; then
+	printf 'UUID=%s\t/\text4\tdefaults,errors=remount-ro\t0\t1\n' "$root_uuid" >>"$mnt/etc/fstab"
+	if [[ -n $esp_part ]]; then
+		esp_uuid=$(blkid -s UUID -o value "/dev/$esp_part" 2>/dev/null)
+		[[ -n $esp_uuid ]] && printf 'UUID=%s\t/boot/efi\tvfat\tumask=0077\t0\t2\n' "$esp_uuid" >>"$mnt/etc/fstab"
+	fi
+	note "fstab: root passno=1$([[ -n ${esp_uuid:-} ]] && echo ", ESP passno=2")"
+else
+	note "fstab already carries a root entry"
+fi
+
+# Without this, an fsck needing manual intervention drops to an emergency shell
+# -- which on a headless board is indistinguishable from a dead box.
+if [[ -n $esp ]]; then
+	grubcfg=$(find "$esp" -iname 'grub.cfg' -print -quit 2>/dev/null)
+	if [[ -n $grubcfg ]]; then
+		if grep -q 'fsck.repair' "$grubcfg"; then
+			note "fsck.repair already on the kernel line"
+		else
+			cp "$grubcfg" "$grubcfg.bak"
+			sed -i 's/\(root=[^ \\]*\)/\1 fsck.repair=yes/' "$grubcfg"
+			note "fsck.repair=yes added to $(basename "$grubcfg") (backup alongside)"
+		fi
+	else
+		warn "no grub.cfg on the ESP -- set fsck.repair=yes by hand"
+	fi
+else
+	warn "no ESP mounted -- fsck.repair=yes not set"
+fi
+
+# ---------------------------------------------------------------- logs survive a crash
+
+info "Crash-surviving logs"
+
+# Orange Pi and Armbian images mount /var/log as a small tmpfs and rsync it to
+# /var/log.hdd only from the service's ExecStop. There is no timer, so a hard
+# hang loses every log since the last clean shutdown -- which is exactly the
+# case you need them for. The service exists to spare SD-card write cycles; on
+# any other medium it costs the evidence and buys nothing.
+ramlog=
+for n in orangepi-ramlog armbian-ramlog log2ram; do
+	[[ -f $mnt/etc/default/$n || -f $mnt/lib/systemd/system/$n.service || -f $mnt/usr/lib/systemd/system/$n.service ]] && {
+		ramlog=$n
+		break
+	}
+done
+
+# Tracks whether /var/log will be a real filesystem at boot. The journald
+# settings below are only safe when it is.
+log_on_disk=1
+
+if [[ -z $ramlog ]]; then
+	note "no RAM-log service in the image"
+elif ((keep_ramlog)); then
+	warn "$ramlog left enabled -- a hard crash will lose its logs"
+	log_on_disk=0
+else
+	if [[ -f $mnt/etc/default/$ramlog ]]; then
+		sed -i 's/^ENABLED=true/ENABLED=false/' "$mnt/etc/default/$ramlog"
+	fi
+	# Three mechanisms, because any one alone leaves it running: the unit is
+	# pulled in by a .wants symlink, the script re-reads ENABLED itself, and a
+	# mask stops a later `systemctl enable` from quietly restoring it. The glob
+	# covers images that install into multi-user.target rather than sysinit.
+	rm -f "$mnt"/etc/systemd/system/*.wants/"$ramlog".service
+	unit=$mnt/etc/systemd/system/$ramlog.service
+	if [[ -e $unit && ! -L $unit ]]; then
+		# Never clobber a real unit file the image shipped at this path.
+		warn "$ramlog: /etc/systemd/system/$ramlog.service is a real file, not masking"
+	else
+		ln -sf /dev/null "$unit"
+	fi
+	note "$ramlog disabled and masked"
+fi
+
+if ((log_on_disk)); then
+	mkdir -p "$mnt/var/log/journal"
+	chmod 2755 "$mnt/var/log/journal"
+	# setgid above only means anything once the group owns it; journald repairs
+	# this itself at startup, but a correct image needs no repair.
+	if grep -qE '^systemd-journal:' "$mnt/etc/group" 2>/dev/null; then
+		chown "0:$(awk -F: '/^systemd-journal:/{print $3}' "$mnt/etc/group")" "$mnt/var/log/journal"
+	fi
+	mkdir -p "$mnt/etc/systemd/journald.conf.d"
+	printf '[Journal]\nStorage=persistent\nSystemMaxUse=200M\n' \
+		>"$mnt/etc/systemd/journald.conf.d/10-persistent.conf"
+	note "journald: Storage=persistent, SystemMaxUse=200M, /var/log/journal created"
+else
+	# Writing these under a tmpfs is worse than leaving them alone: persistent
+	# storage would point at a filesystem recreated every boot, and a cap above
+	# the tmpfs size is how journald fills /var/log.
+	warn "journald left at image defaults -- /var/log is a tmpfs, so persistent storage would be a no-op"
 fi
 
 # ---------------------------------------------------------------- identity
