@@ -1,6 +1,6 @@
 # Camera stack: Orange Pi 6 Plus vs Raspberry Pi 5
 
-Why MIPI capture is unreliable on the opi6 and rock solid on the rpi5. The difference is architectural, not a question of polish.
+Why MIPI capture is unreliable on the opi6 and rock solid on the rpi5. The difference is architectural, not a question of polish — and on the opi6 side the failure is a kernel panic in the vendor ISP driver, not flakiness.
 
 ## The two designs
 
@@ -24,7 +24,7 @@ On the opi6, a vendor daemon must be running for the ISP to work at all, and tha
 | **The daemon cannot be removed** | with `isp-daemon` stopped: 0 OK / 3 FAIL, 33 s hangs |
 | **The daemon cannot own the stream either** | `isp_app -f` with `start` keeps the camera up, but then GStreamer gets EBUSY in 220 ms: 1 OK / 5 FAIL |
 | **Only one camera is active** | the unit runs `isp_app -s 0`; `/dev/video7`, `/dev/video8` deliver no frames |
-| **Capture usually fails** | 3 of 10 MIPI runs succeeded in a measured pass, against 10 of 10 on USB on the same board. Failures hang rather than error, and one run rebooted the board. The mechanism is not established |
+| **Capture panics the kernel** | 4 of 10 MIPI runs reset the board, against 10 of 10 clean on USB. A null-ish `vdev->queue->lock` dereference in `armcb_isp_v4l2`, traced identically five times, and it happens with `isp-daemon` stopped too — a driver bug, not daemon contention. See the README |
 | **Half the daemon's interface is undocumented** | `isp_app -h` lists five options; the binary's getopt string is `hgtf:m:s:dp:nc` — ten. The `-s` the unit passes is valid and functional (`Set singleCamIdx 0`), just absent from the help |
 | **Non-standard colorimetry** | driver reports `2:4:16:1` (BT601 matrix+transfer, BT709 primaries) — matches no GStreamer preset. `colorimetry=bt709` must be forced or negotiation fails |
 | **Multiplanar-only capture** | format is `NM12`, Video Capture **Multiplanar**. `ffmpeg` cannot open it at all; `videoparse` SIGSEGVs on the non-contiguous planes |
@@ -88,8 +88,8 @@ The irony: `ov13858.c` **is** in mainline and sits unused, and this kernel also 
 
 ## Practical guidance
 
-- **If it must not fail, use a USB camera.** It bypasses the entire vendor ISP.
-- **On MIPI, retry.** A measured pass got 3 of 10; budget for repeats rather than a fixed rate.
+- **If it must not fail, use a USB camera.** It bypasses the entire vendor ISP. Budget for its real cost, though: a USB 2.0 webcam reaches 1080p30 only in MJPEG, so the frames arrive compressed and need a JPEG decode before the hardware encoder — and hardware decode is itself serialised, so that decode lands in software. Uncompressed YUYV goes straight into the encoder with no conversion, but USB 2.0 caps it at 640×480@30.
+- **On MIPI, retry — and expect resets, not just failures.** A measured pass got 3 of 10 succeeding, and a later one had 4 of 10 resetting the board outright. Budget for repeats *and* for the board going down mid-run.
 - Do not loop `systemctl restart isp-daemon` — that rebooted the board twice.
 
 ## What is open and what is not

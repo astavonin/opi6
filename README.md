@@ -19,7 +19,7 @@ Key: `~/.ssh/id_ed25519_opi6`. Password login is **off** — that key is the onl
 | CPU | 4× A720 @ 2.6 GHz + 4× A720 @ 2.4 GHz + 4× A520 @ 1.8 GHz |
 | GPU | Immortalis-G720 MC10 (10 cores) |
 | NPU | Zhouyi V3 — 3 cores × 4 TECs, 30 TOPS |
-| VPU | Linlon V8 (`amvx`) — separate encode and decode engines |
+| VPU | Linlon V8 (`amvx`) — separate encode and decode engines. Encode `/dev/video1`, decode `/dev/video0`; four hardware session slots |
 | Camera | 13 MP MIPI-CSI via Orange Pi CAM adapter (module sold for OPi 5/RK3588; works here) |
 | Disk | Samsung 980 1 TB NVMe |
 | WiFi | RTL8852BE → `wlp1s0` |
@@ -45,15 +45,34 @@ It replaced an Armbian install, which used `systemd-networkd` + `wpa_supplicant`
 | Camera capture | `/dev/video9` only — NM12, 1920×1080 / 1280×720 / 640×480 @ 30 fps |
 | Raw capture to disk | 720p, exact byte count |
 | HW encode (synthetic) | H.264 + H.265 at 1080p from `videotestsrc` |
-| HW encode (MIPI camera) | 720p **and** 1080p, H.264 and H.265 — but unreliable, see below |
+| HW encode (MIPI camera) | 720p **and** 1080p, H.264 and H.265 — but it panics the kernel, see below |
 | HW encode (USB camera) | 720p and 1080p, H.264 and H.265 — reliable |
 | File → HW encode | H.265, verified with `ffprobe` |
+| Parallel HW encode | **18 × 1080p30 sustained** on one engine, ~0.11 CPU cores per stream. Ceiling is ~537 fps at 1080p |
+| Zero-copy encode input | `output-io-mode=dmabuf-import` from a USB camera |
 
-### MIPI capture is unreliable; the mechanism is not established
+### MIPI capture panics the kernel
 
-Measured on one sitting: **3 of 10** MIPI runs succeeded, against **10 of 10** on the USB camera on the same board. Failures hang rather than error. The board hard-rebooted during run 8.
+It does not merely fail unreliably. Measured 2026-11-10: **4 of 10** MIPI capture runs reset the board, against **10 of 10** clean USB runs — six resets in one session. An earlier sitting recorded 3 of 10 succeeding, the rest hanging or resetting.
 
-**The cause is not pinned down.** An earlier session observed `isp_app` stopping the camera ~5 s after start (`FAKE SLEEP: sleepTimeUs = 5000000`, then `camera 0 stopped`) with systemd restarting it, which would explain a race. That was **not reproducible**: a later pass saw no such lines on either boot and `NRestarts` stayed 0. The format string does exist in the binary, so it is a real code path. At the time the journal was volatile, so the original observation could not be re-read — that is fixed now (see Guards), and a recurrence will be captured. Treat the 5-second cycle as a lead, not the answer.
+The panic is identical across five traced occurrences:
+
+```
+Unable to handle kernel paging request, ESR = 0x96000004   (level 0 translation fault)
+pc : mutex_lock_interruptible+0x10/0x6c
+lr : __video_do_ioctl+0xe0/0x3c8
+Comm: v4l2src0:src          armcb_isp_v4l2(O) loaded, kernel tainted O
+```
+
+Call path is `mutex_lock_interruptible` ← `video_usercopy` ← `video_ioctl2` ← `v4l2_ioctl` ← `__arm64_sys_ioctl`, and the faulting thread is GStreamer's own capture thread. **The mutex pointer holds garbage** — in one panic `0x494e495f43455355`, which is the ASCII `USEC_INI` little-endian; another held an unrelated value, so the contents vary between runs. The last driver lines before every fault are `armcb_g_param` entering, then `armcb_v4l2_g_selection` logging `target = 257, type = 1`.
+
+**It happens with `isp-daemon` stopped as well as running**, so it is a driver bug rather than daemon contention — which also refutes the idea that the daemon is the only route to the sensor.
+
+*Unproven reading, recorded as a lead:* `armcb_v4l2_core.c` assigns and clears `vdev->queue` directly around the streaming entry points without serialising against in-flight ioctls, which would let an ioctl dereference `vdev->queue->lock` after the backing `vb2_queue` was freed and its memory reused. The source shows the unserialised assignments and the trace shows a garbage lock pointer; nothing measured connects the two. `armcb_v4l2_g_selection` carries the vendor's own `/* need fix: hard code for NV12M 1080p fmt */` comment.
+
+This supersedes the earlier `FAKE SLEEP: sleepTimeUs = 5000000` lead, which was never reproducible.
+
+`/sys/fs/pstore/` stays empty after every panic even though `ramoops` is registered, so these traces survive only because journald was given a persistent store (see Guards). Under the vendor default all of it is lost on reset.
 
 `isp-daemon` runs `isp_app -s 0`. **`-s` is undocumented but valid** — the binary's getopt string is `hgtf:m:s:dp:nc`, `-s` takes an argument, and the daemon logs `Set singleCamIdx 0`. Five of its ten options are missing from `-h`.
 
@@ -64,6 +83,8 @@ Do **not** loop `systemctl restart isp-daemon` — that rebooted the board twice
 For anything that must not fail, use the **USB camera** — `uvcvideo` never touches the ISP and was 100 % reliable.
 
 Full architecture comparison against a Raspberry Pi 5, and the alternatives we ruled out: [docs/isp-vs-rpi5.md](docs/isp-vs-rpi5.md).
+
+How many streams the VPU encodes at once, why decode serialises, and the measurements behind both: [docs/parallel-encoding-research.md](docs/parallel-encoding-research.md).
 
 #### The sensor is not the cause
 
@@ -103,12 +124,14 @@ gst-launch-1.0 -e v4l2src device=/dev/video3 num-buffers=60 \
 
 | Thing | Symptom |
 |---|---|
-| MIPI encode, most runs | hangs; 3/10 succeeded in a measured pass vs 10/10 on USB. Not resolution- or codec-specific. Retry |
-| `output-io-mode=dmabuf` on the encoder | hangs every time here, despite appearing in the vendor's own documented pipeline |
+| MIPI encode, most runs | **panics the kernel** in `armcb_isp_v4l2` — 4/10 runs reset the board, 10/10 clean on USB. Not resolution- or codec-specific |
+| `output-io-mode=dmabuf` **from MIPI** | hangs every time. Not an encoder limit — fed from a USB camera the encoder imports dmabuf fine, with `output-io-mode=dmabuf-import` |
 | `/dev/video7`, `/dev/video8` | no frames — **expected**: `isp-daemon` runs `isp_app -s 0` (single sensor). `-m 2` is said to enable both CSI ports; **untested here**, and `-m` is one of the five options `-h` does not document |
 | **ffmpeg** camera capture | `Not a video capture device` — its v4l2 demuxer cannot open multiplanar nodes |
 | `videoparse` on camera buffers | SIGSEGV (treats non-contiguous NM12 planes as packed) |
 | Default colorimetry | driver rejects `bt601`; must force `bt709` |
+| Concurrent HW decode | only one decode session at a time, and an encode starting beside it wedges the decode permanently. Encode has no such limit |
+| `output-io-mode=dmabuf` (enum 4) | silently falls back to mmap instead of erroring, so a dmabuf pipeline can "pass" while proving nothing. Use `dmabuf-import` (enum 5) |
 | Fan control from Linux | no ACPI fan object, no PWM, no EC. BIOS is on Auto Mode, idles ~40 % |
 
 ### Crashes
