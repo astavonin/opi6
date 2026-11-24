@@ -41,7 +41,7 @@ It replaced an Armbian install, which used `systemd-networkd` + `wpa_supplicant`
 | | |
 |---|---|
 | GPU | Vulkan 1.3.296 `Mali-G720-Immortalis`, OpenGL ES, 5 render nodes |
-| NPU | `zhouyi-v3`, KMD v5.11.0, `/dev/aipu` opens, `libnoe` + Python bindings |
+| NPU | `zhouyi-v3`, KMD v5.11.0, `libnoe` + Python bindings — MobileNet v2 at **1.7–2.7 ms** per inference via `NOE_Engine` |
 | Camera capture | `/dev/video9` only — NM12, 1920×1080 / 1280×720 / 640×480 @ 30 fps |
 | Raw capture to disk | 720p, exact byte count |
 | HW encode (synthetic) | H.264 + H.265 at 1080p from `videotestsrc` |
@@ -50,6 +50,8 @@ It replaced an Armbian install, which used `systemd-networkd` + `wpa_supplicant`
 | File → HW encode | H.265, verified with `ffprobe` |
 | Parallel HW encode | **18 × 1080p30 sustained** on one engine, ~0.11 CPU cores per stream. Ceiling is ~537 fps at 1080p |
 | Zero-copy encode input | `output-io-mode=dmabuf-import` from a USB camera |
+
+What the NPU runs, why LLMs on it are blocked, and the driver/SDK version traps: [docs/npu-research.md](docs/npu-research.md).
 
 ### MIPI capture panics the kernel
 
